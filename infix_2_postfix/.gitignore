@@ -1,0 +1,6 @@
+*.o
+.flavor
+.objs
+infix_2_postfix.so
+assets.h
+cert
