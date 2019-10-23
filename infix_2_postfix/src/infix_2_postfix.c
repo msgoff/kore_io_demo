@@ -4,6 +4,7 @@
 
 #include <kore/kore.h>
 #include <kore/http.h>
+#include <kore/pgsql.h>
 
 #include "assets.h"
 
@@ -54,10 +55,18 @@ int prec_booster;
 int		page(struct http_request *);
 int shunting_yard_func(struct http_request *req, char *data);
 
-
+int initDatabase(int);
 int init(void);
 pat_t* match(const char *s, pat_t *p, str_tok_t * t, const char **e);
 int parse(const char *s);
+
+int initDatabase(int state)
+{
+	/* Register our database. */
+	kore_pgsql_register("db", "host=/tmp dbname=expressions");
+
+	return (KORE_RESULT_OK);
+}
 
 int
 page(struct http_request *req)
@@ -68,6 +77,9 @@ page(struct http_request *req)
 
 	char *text;
 
+	struct kore_pgsql sql;
+	char *expression;
+	int rows, i;
 
 	if(req->method == HTTP_METHOD_GET){
 		http_populate_get(req);
@@ -80,6 +92,7 @@ page(struct http_request *req)
 
 	if(req->method == HTTP_METHOD_GET){
 		kore_buf_replace_string(b, "$inputText$", NULL, 0);
+		kore_buf_replace_string(b, "$lastFive$", NULL, 0);
 
 		http_response_header(req, "content-type", "text/html");
 		d = kore_buf_release(b, &len);
@@ -92,12 +105,75 @@ page(struct http_request *req)
 	http_populate_multipart_form(req);
 
 	if(http_argument_get_string(req, "inputTextForm", &text)){
+		if(parse(text) == 0)
+		{
+			kore_buf_replace_string(b, "$inputText$", "NOT OK!", strlen("NOT OK"));
+			kore_buf_replace_string(b, "$lastFive$", NULL, 0);
+			http_response_header(req, "content-type", "text/html");
+			d = kore_buf_release(b, &len);
+			http_response(req, 200, d, len);
+			kore_free(d);
+
+			return KORE_RESULT_OK;
+		}
 		char* result = (char *)malloc(sizeof(char)*(strlen(text) + 20));
 		strcpy(result, text);
 		strcat(result, ": OK!");
+
+		req->status = HTTP_STATUS_INTERNAL_ERROR;
+		kore_pgsql_init(&sql);
+
+		if(!kore_pgsql_setup(&sql, "db", KORE_PGSQL_SYNC))
+		{
+			kore_pgsql_logerror(&sql);
+			http_response(req, req->status, NULL, 0);
+			kore_pgsql_cleanup(&sql);
+			return (KORE_RESULT_OK);
+		}
+
+		char * query = (char *)calloc(150, sizeof(char));
+		strcpy(query, "INSERT INTO expression ( expr ) VALUES ( '");
+		strcat(query, text);
+		strcat(query, "');");
+		if(!kore_pgsql_query(&sql, query))
+		{
+			kore_pgsql_logerror(&sql);
+			http_response(req, req->status, NULL, 0);
+			kore_pgsql_cleanup(&sql);
+			return (KORE_RESULT_OK);
+		}
+
+		char * select_query = (char *)calloc(150, sizeof(char));
+		// SELECT * FROM mytable ORDER BY record_date ASC LIMIT 5 OFFSET 4
+		strcpy(select_query, "SELECT * FROM expression LIMIT 5 OFFSET (SELECT COUNT(*) FROM expression ) - 5;");
+		if(!kore_pgsql_query(&sql, select_query))
+		{
+			kore_pgsql_logerror(&sql);
+			http_response(req, req->status, NULL, 0);
+			kore_pgsql_cleanup(&sql);
+			return (KORE_RESULT_OK);
+		}
+
+		char * lastFiveRows = (char *)malloc(250 * sizeof(char));
+		strcpy(lastFiveRows, "");
+
+		rows = kore_pgsql_ntuples(&sql);
+		for(i = 0; i < rows; i++)
+		{
+			expression = kore_pgsql_getvalue(&sql, i, 0);
+			strcat(lastFiveRows, expression);
+			strcat(lastFiveRows, "\n");
+			//kore_log(LOG_NOTICE, "expression: '%s'", expression);
+		}
+		
+		req->status = HTTP_STATUS_OK;
+		kore_pgsql_cleanup(&sql);
 		kore_buf_replace_string(b, "$inputText$", result, strlen(result));
+		kore_buf_replace_string(b, "$lastFive$", lastFiveRows, strlen(lastFiveRows));
+
 	}else{
 		kore_buf_replace_string(b, "$inputText$", "NOT OK!", strlen("NOT OK"));
+		kore_buf_replace_string(b, "$lastFive$", NULL, 0);
 	}
 
 	http_response_header(req, "content-type", "text/html");
